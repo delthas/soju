@@ -2275,16 +2275,7 @@ func (dc *downstreamConn) handleMessageRegistered(ctx context.Context, msg *irc.
 			options = msg.Params[1]
 		}
 
-		optionsParts := strings.SplitN(options, "%", 2)
-		// TODO: add support for WHOX flags in optionsParts[0]
-		var fields, whoxToken string
-		if len(optionsParts) == 2 {
-			optionsParts := strings.SplitN(optionsParts[1], ",", 2)
-			fields = strings.ToLower(optionsParts[0])
-			if len(optionsParts) == 2 && strings.Contains(fields, "t") {
-				whoxToken = optionsParts[1]
-			}
-		}
+		fields, whoxToken := xirc.ParseWHOXOptions(options)
 
 		// TODO: support mixed bouncer/upstream WHO queries
 		maskCM := casemapASCII(mask)
@@ -2345,6 +2336,29 @@ func (dc *downstreamConn) handleMessageRegistered(ctx context.Context, msg *irc.
 		if err != nil {
 			// Ignore the error here, because clients don't know how to deal
 			// with anything other than RPL_ENDOFWHO
+			dc.SendMessage(&irc.Message{
+				Prefix:  dc.srv.prefix(),
+				Command: irc.RPL_ENDOFWHO,
+				Params:  []string{dc.nick, endOfWhoToken, "End of /WHO list"},
+			})
+			return nil
+		}
+
+		// Check if we have the reply cached
+		if l, ok := uc.getCachedWHO(upstreamMask, fields); ok {
+			for _, uu := range l {
+				info := xirc.WHOXInfo{
+					Token:    whoxToken,
+					Username: uu.Username,
+					Hostname: uu.Hostname,
+					Server:   uu.Server,
+					Nickname: uu.Nickname,
+					Flags:    uu.Flags,
+					Account:  uu.Account,
+					Realname: uu.Realname,
+				}
+				dc.SendMessage(xirc.GenerateWHOXReply(dc.srv.prefix(), dc.nick, fields, &info))
+			}
 			dc.SendMessage(&irc.Message{
 				Prefix:  dc.srv.prefix(),
 				Command: irc.RPL_ENDOFWHO,
