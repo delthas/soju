@@ -241,13 +241,14 @@ var permanentDownstreamCaps = map[string]string{
 // needAllDownstreamCaps is the list of downstream capabilities that
 // require support from all upstreams to be enabled.
 var needAllDownstreamCaps = map[string]string{
-	"account-notify": "",
-	"account-tag":    "",
-	"away-notify":    "",
-	"chghost":        "",
-	"extended-join":  "",
-	"message-tags":   "",
-	"multi-prefix":   "",
+	"account-notify":   "",
+	"account-tag":      "",
+	"away-notify":      "",
+	"chghost":          "",
+	"extended-join":    "",
+	"labeled-response": "",
+	"message-tags":     "",
+	"multi-prefix":     "",
 
 	"draft/extended-monitor": "",
 }
@@ -328,6 +329,10 @@ type downstreamConn struct {
 	registration *downstreamRegistration // nil after RPL_WELCOME
 
 	lastBatchRef uint64
+
+	label        string
+	labelBatch   string
+	labelPending *irc.Message
 
 	monitored casemapMap
 }
@@ -542,6 +547,42 @@ func (dc *downstreamConn) readMessages(ch chan<- event) error {
 	return nil
 }
 
+func (dc *downstreamConn) DeferredResponse() {
+	if dc.labelPending != nil {
+		panic(fmt.Sprintf("called DeferredResponse after buffering a message: %v", dc.labelPending))
+	}
+	if dc.labelBatch != "" {
+		panic("called DeferredResponse after sending messages")
+	}
+	dc.label = ""
+}
+
+func (dc *downstreamConn) FlushBatch() {
+	if dc.labelPending != nil {
+		dc.srv.metrics.downstreamOutMessagesTotal.Inc()
+		dc.conn.SendMessage(context.TODO(), copyWithTag(dc.labelPending, "label", dc.label))
+	} else if dc.labelBatch != "" && dc.label != "" {
+		dc.srv.metrics.downstreamOutMessagesTotal.Inc()
+		dc.conn.SendMessage(context.TODO(), &irc.Message{
+			Prefix:  dc.srv.prefix(),
+			Command: "BATCH",
+			Params:  []string{fmt.Sprintf("-%s", dc.labelBatch)},
+		})
+	} else if dc.label != "" {
+		dc.srv.metrics.downstreamOutMessagesTotal.Inc()
+		dc.conn.SendMessage(context.TODO(), &irc.Message{
+			Prefix:  dc.srv.prefix(),
+			Command: "ACK",
+			Tags: irc.Tags{
+				"label": irc.TagValue(dc.label),
+			},
+		})
+	}
+	dc.label = ""
+	dc.labelPending = nil
+	dc.labelBatch = ""
+}
+
 // SendMessage sends an outgoing message.
 //
 // This can only called from the user goroutine.
@@ -595,8 +636,48 @@ func (dc *downstreamConn) SendMessage(msg *irc.Message) {
 		msg.Prefix = nil
 	}
 
-	dc.srv.metrics.downstreamOutMessagesTotal.Inc()
-	dc.conn.SendMessage(context.TODO(), msg)
+	if dc.labelPending != nil {
+		// create a batch
+		dc.lastBatchRef++
+		dc.labelBatch = fmt.Sprintf("%v", dc.lastBatchRef)
+		dc.srv.metrics.downstreamOutMessagesTotal.Inc()
+		dc.conn.SendMessage(context.TODO(), &irc.Message{
+			Tags:    irc.Tags{"label": irc.TagValue(dc.label)},
+			Prefix:  dc.srv.prefix(),
+			Command: "BATCH",
+			Params:  []string{"+" + dc.labelBatch, "labeled-response"},
+		})
+
+		// send the buffered message
+		m := dc.labelPending.Copy()
+		if m.Tags["batch"] == "" {
+			if m.Tags == nil {
+				m.Tags = make(irc.Tags)
+			}
+			m.Tags["batch"] = irc.TagValue(dc.labelBatch)
+		}
+		dc.srv.metrics.downstreamOutMessagesTotal.Inc()
+		dc.conn.SendMessage(context.TODO(), m)
+		dc.labelPending = nil
+	}
+	if dc.labelBatch != "" {
+		// send the current message in the batch
+		m := msg.Copy()
+		if m.Tags["batch"] == "" {
+			if m.Tags == nil {
+				m.Tags = make(irc.Tags)
+			}
+			m.Tags["batch"] = irc.TagValue(dc.labelBatch)
+		}
+		dc.srv.metrics.downstreamOutMessagesTotal.Inc()
+		dc.conn.SendMessage(context.TODO(), m)
+	} else if dc.label != "" {
+		// first message we're sending: buffer it
+		dc.labelPending = msg
+	} else {
+		dc.srv.metrics.downstreamOutMessagesTotal.Inc()
+		dc.conn.SendMessage(context.TODO(), msg)
+	}
 }
 
 func (dc *downstreamConn) SendBatch(typ string, params []string, tags irc.Tags, f func(batchRef irc.TagValue)) {
@@ -719,15 +800,29 @@ func (dc *downstreamConn) handleMessage(ctx context.Context, msg *irc.Message) e
 	ctx, cancel = context.WithTimeout(ctx, handleDownstreamMessageTimeout)
 	defer cancel()
 
+	if dc.caps.IsEnabled("labeled-response") {
+		dc.label = string(msg.Tags["label"])
+	}
+	defer func() {
+		dc.FlushBatch()
+	}()
+
 	switch msg.Command {
 	case "QUIT":
 		return dc.Close()
 	default:
+		var err error
 		if dc.registered {
-			return dc.handleMessageRegistered(ctx, msg)
+			err = dc.handleMessageRegistered(ctx, msg)
 		} else {
-			return dc.handleMessageUnregistered(ctx, msg)
+			err = dc.handleMessageUnregistered(ctx, msg)
 		}
+		if ircErr, ok := err.(ircError); ok {
+			ircErr.Message.Prefix = dc.srv.prefix()
+			dc.SendMessage(ircErr.Message)
+			err = nil
+		}
+		return err
 	}
 }
 
@@ -1720,10 +1815,7 @@ func (dc *downstreamConn) runUntilRegistered() error {
 		}
 
 		err = dc.handleMessage(ctx, msg)
-		if ircErr, ok := err.(ircError); ok {
-			ircErr.Message.Prefix = dc.srv.prefix()
-			dc.SendMessage(ircErr.Message)
-		} else if err != nil {
+		if err != nil {
 			return fmt.Errorf("failed to handle IRC command %q: %v", msg, err)
 		}
 	}
@@ -1805,10 +1897,11 @@ func (dc *downstreamConn) handleMessageRegistered(ctx context.Context, msg *irc.
 		}
 
 		if uc := dc.upstream(); uc != nil {
-			uc.SendMessageLabeled(ctx, dc.id, &irc.Message{
+			uc.SendMessageLabeled(ctx, dc.id, dc.label, &irc.Message{
 				Command: "NICK",
 				Params:  []string{nick},
 			})
+			dc.DeferredResponse()
 		} else {
 			dc.SendMessage(&irc.Message{
 				Prefix:  dc.prefix(),
@@ -1845,7 +1938,7 @@ func (dc *downstreamConn) handleMessageRegistered(ctx context.Context, msg *irc.
 
 			if uc := dc.upstream(); uc != nil && uc.caps.IsEnabled("setname") {
 				// Upstream will reply with a SETNAME message on success
-				uc.SendMessage(ctx, &irc.Message{
+				uc.SendMessageLabeled(ctx, dc.id, dc.label, &irc.Message{
 					Command: "SETNAME",
 					Params:  []string{realname},
 				})
@@ -1887,7 +1980,8 @@ func (dc *downstreamConn) handleMessageRegistered(ctx context.Context, msg *irc.
 			keys = strings.Split(msg.Params[1], ",")
 		}
 
-		for i, name := range strings.Split(namesStr, ",") {
+		names := strings.Split(namesStr, ",")
+		for i, name := range names {
 			uc, upstreamName, err := dc.unmarshalEntity(name)
 			if err != nil {
 				return err
@@ -1916,10 +2010,20 @@ func (dc *downstreamConn) handleMessageRegistered(ctx context.Context, msg *irc.
 				if key != "" {
 					params = append(params, key)
 				}
-				uc.SendMessageLabeled(ctx, dc.id, &irc.Message{
-					Command: "JOIN",
-					Params:  params,
-				})
+				if len(names) == 1 {
+					// only one channel: defer the labeled-response to the upstream
+					uc.SendMessageLabeled(ctx, dc.id, dc.label, &irc.Message{
+						Command: "JOIN",
+						Params:  params,
+					})
+					dc.DeferredResponse()
+				} else {
+					// general case: respond to labeled-response locally
+					uc.SendMessageLabeled(ctx, dc.id, "", &irc.Message{
+						Command: "JOIN",
+						Params:  params,
+					})
+				}
 			}
 
 			ch := uc.network.channels.Value(upstreamName)
@@ -1952,7 +2056,8 @@ func (dc *downstreamConn) handleMessageRegistered(ctx context.Context, msg *irc.
 			reason = msg.Params[1]
 		}
 
-		for _, name := range strings.Split(namesStr, ",") {
+		names := strings.Split(namesStr, ",")
+		for _, name := range names {
 			uc, upstreamName, err := dc.unmarshalEntity(name)
 			if err != nil {
 				return err
@@ -1977,10 +2082,20 @@ func (dc *downstreamConn) handleMessageRegistered(ctx context.Context, msg *irc.
 				if reason != "" {
 					params = append(params, reason)
 				}
-				uc.SendMessageLabeled(ctx, dc.id, &irc.Message{
-					Command: "PART",
-					Params:  params,
-				})
+				if len(names) == 1 {
+					// only one channel: defer the labeled-response to the upstream
+					uc.SendMessageLabeled(ctx, dc.id, dc.label, &irc.Message{
+						Command: "PART",
+						Params:  params,
+					})
+					dc.DeferredResponse()
+				} else {
+					// general case: respond to labeled-response locally
+					uc.SendMessageLabeled(ctx, dc.id, "", &irc.Message{
+						Command: "PART",
+						Params:  params,
+					})
+				}
 
 				if err := uc.network.deleteChannel(ctx, upstreamName); err != nil {
 					dc.logger.Printf("failed to delete channel %q: %v", upstreamName, err)
@@ -2038,10 +2153,20 @@ func (dc *downstreamConn) handleMessageRegistered(ctx context.Context, msg *irc.
 			if reason != "" {
 				params = append(params, reason)
 			}
-			uc.SendMessageLabeled(ctx, dc.id, &irc.Message{
-				Command: "KICK",
-				Params:  params,
-			})
+			if len(users) == 1 {
+				// only one user: defer the labeled-response to the upstream
+				uc.SendMessageLabeled(ctx, dc.id, dc.label, &irc.Message{
+					Command: "KICK",
+					Params:  params,
+				})
+				dc.DeferredResponse()
+			} else {
+				// general case: respond to labeled-response locally
+				uc.SendMessageLabeled(ctx, dc.id, "", &irc.Message{
+					Command: "KICK",
+					Params:  params,
+				})
+			}
 		}
 	case "MODE":
 		var name string
@@ -2057,10 +2182,11 @@ func (dc *downstreamConn) handleMessageRegistered(ctx context.Context, msg *irc.
 		if casemapASCII(name) == dc.nickCM {
 			if modeStr != "" {
 				if uc := dc.upstream(); uc != nil {
-					uc.SendMessageLabeled(ctx, dc.id, &irc.Message{
+					uc.SendMessageLabeled(ctx, dc.id, dc.label, &irc.Message{
 						Command: "MODE",
 						Params:  []string{uc.nick, modeStr},
 					})
+					dc.DeferredResponse()
 				} else {
 					dc.SendMessage(&irc.Message{
 						Prefix:  dc.srv.prefix(),
@@ -2098,10 +2224,11 @@ func (dc *downstreamConn) handleMessageRegistered(ctx context.Context, msg *irc.
 		if modeStr != "" {
 			params := []string{upstreamName, modeStr}
 			params = append(params, msg.Params[2:]...)
-			uc.SendMessageLabeled(ctx, dc.id, &irc.Message{
+			uc.SendMessageLabeled(ctx, dc.id, dc.label, &irc.Message{
 				Command: "MODE",
 				Params:  params,
 			})
+			dc.DeferredResponse()
 		} else {
 			ch := uc.channels.Value(upstreamName)
 			if ch == nil {
@@ -2147,10 +2274,11 @@ func (dc *downstreamConn) handleMessageRegistered(ctx context.Context, msg *irc.
 
 		if len(msg.Params) > 1 { // setting topic
 			topic := msg.Params[1]
-			uc.SendMessageLabeled(ctx, dc.id, &irc.Message{
+			uc.SendMessageLabeled(ctx, dc.id, dc.label, &irc.Message{
 				Command: "TOPIC",
 				Params:  []string{upstreamName, topic},
 			})
+			dc.DeferredResponse()
 		} else { // getting topic
 			ch := uc.channels.Value(upstreamName)
 			if ch == nil {
@@ -2190,6 +2318,7 @@ func (dc *downstreamConn) handleMessageRegistered(ctx context.Context, msg *irc.
 		}
 
 		uc.enqueueCommand(dc, msg)
+		dc.DeferredResponse()
 	case "NAMES":
 		if len(msg.Params) == 0 {
 			dc.SendMessage(&irc.Message{
@@ -2212,10 +2341,20 @@ func (dc *downstreamConn) handleMessageRegistered(ctx context.Context, msg *irc.
 				sendNames(dc, ch)
 			} else {
 				// NAMES on a channel we have not joined, ask upstream
-				uc.SendMessageLabeled(ctx, dc.id, &irc.Message{
-					Command: "NAMES",
-					Params:  []string{upstreamName},
-				})
+				if len(channels) == 1 {
+					// only one channel: defer the labeled-response to the upstream
+					uc.SendMessageLabeled(ctx, dc.id, dc.label, &irc.Message{
+						Command: "NAMES",
+						Params:  []string{upstreamName},
+					})
+					dc.DeferredResponse()
+				} else {
+					// general case: respond to labeled-response locally
+					uc.SendMessageLabeled(ctx, dc.id, "", &irc.Message{
+						Command: "NAMES",
+						Params:  []string{upstreamName},
+					})
+				}
 			}
 		}
 	case "WHO":
@@ -2325,6 +2464,7 @@ func (dc *downstreamConn) handleMessageRegistered(ctx context.Context, msg *irc.
 			Command: "WHO",
 			Params:  params,
 		})
+		dc.DeferredResponse()
 	case "WHOIS":
 		if len(msg.Params) == 0 {
 			return ircError{&irc.Message{
@@ -2431,6 +2571,7 @@ func (dc *downstreamConn) handleMessageRegistered(ctx context.Context, msg *irc.
 			Command: "WHOIS",
 			Params:  params,
 		})
+		dc.DeferredResponse()
 	case "PRIVMSG", "NOTICE", "TAGMSG":
 		var targetsStr, text string
 		if msg.Command != "TAGMSG" {
@@ -2445,7 +2586,8 @@ func (dc *downstreamConn) handleMessageRegistered(ctx context.Context, msg *irc.
 
 		tags := copyClientTags(msg.Tags)
 
-		for _, name := range strings.Split(targetsStr, ",") {
+		targets := strings.Split(targetsStr, ",")
+		for _, name := range targets {
 			params := []string{name}
 			if msg.Command != "TAGMSG" {
 				params = append(params, text)
@@ -2524,11 +2666,22 @@ func (dc *downstreamConn) handleMessageRegistered(ctx context.Context, msg *irc.
 				upstreamParams = append(upstreamParams, unmarshaledText)
 			}
 
-			uc.SendMessageLabeled(ctx, dc.id, &irc.Message{
-				Tags:    tags,
-				Command: msg.Command,
-				Params:  upstreamParams,
-			})
+			if len(targets) == 1 && uc.caps.IsEnabled("echo-message") {
+				// only one target and echo-message is supported: defer the labeled-response to the upstream
+				uc.SendMessageLabeled(ctx, dc.id, dc.label, &irc.Message{
+					Tags:    tags,
+					Command: msg.Command,
+					Params:  upstreamParams,
+				})
+				dc.DeferredResponse()
+			} else {
+				// general case: respond to labeled-response locally
+				uc.SendMessageLabeled(ctx, dc.id, "", &irc.Message{
+					Tags:    tags,
+					Command: msg.Command,
+					Params:  upstreamParams,
+				})
+			}
 
 			// If the upstream supports echo message, we'll produce the message
 			// when it is echoed from the upstream.
@@ -2583,10 +2736,11 @@ func (dc *downstreamConn) handleMessageRegistered(ctx context.Context, msg *irc.
 		}
 		uc := ucChannel
 
-		uc.SendMessageLabeled(ctx, dc.id, &irc.Message{
+		uc.SendMessageLabeled(ctx, dc.id, dc.label, &irc.Message{
 			Command: "INVITE",
 			Params:  []string{upstreamUser, upstreamChannel},
 		})
+		dc.DeferredResponse()
 	case "AUTHENTICATE":
 		// Post-connection-registration AUTHENTICATE is unsupported in
 		// multi-upstream mode, or if the upstream doesn't support SASL
@@ -2619,6 +2773,7 @@ func (dc *downstreamConn) handleMessageRegistered(ctx context.Context, msg *irc.
 				Command: "AUTHENTICATE",
 				Params:  []string{"PLAIN"},
 			})
+			dc.DeferredResponse()
 		}
 	case "REGISTER", "VERIFY":
 		// Check number of params here, since we'll use that to save the
@@ -2637,6 +2792,7 @@ func (dc *downstreamConn) handleMessageRegistered(ctx context.Context, msg *irc.
 
 		uc.logger.Printf("starting %v with account name %v", msg.Command, msg.Params[0])
 		uc.enqueueCommand(dc, msg)
+		dc.DeferredResponse()
 	case "MONITOR":
 		// MONITOR is unsupported in multi-upstream mode
 		uc := dc.upstream()
@@ -2651,6 +2807,8 @@ func (dc *downstreamConn) handleMessageRegistered(ctx context.Context, msg *irc.
 		if err := parseMessageParams(msg, &subcommand); err != nil {
 			return err
 		}
+
+		// TODO: support MONITOR labeled-response through upstream
 
 		switch strings.ToUpper(subcommand) {
 		case "+", "-":
@@ -3193,7 +3351,8 @@ func (dc *downstreamConn) handleMessageRegistered(ctx context.Context, msg *irc.
 			return newUnknownCommandError(msg.Command)
 		}
 
-		uc.SendMessageLabeled(ctx, dc.id, msg)
+		uc.SendMessageLabeled(ctx, dc.id, dc.label, msg)
+		dc.DeferredResponse()
 	}
 	return nil
 }

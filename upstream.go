@@ -101,8 +101,9 @@ func (uc *upstreamChannel) updateAutoDetach(dur time.Duration) {
 }
 
 type pendingUpstreamCommand struct {
-	downstreamID uint64
-	msg          *irc.Message
+	downstreamID    uint64
+	downstreamLabel string
+	msg             *irc.Message
 }
 
 type upstreamConn struct {
@@ -298,6 +299,8 @@ func (uc *upstreamConn) isOurNick(nick string) bool {
 }
 
 func (uc *upstreamConn) abortPendingCommands() {
+	// TODO: support labeled-response
+
 	for _, l := range uc.pendingCmds {
 		for _, pendingCmd := range l {
 			dc := uc.downstreamByID(pendingCmd.downstreamID)
@@ -348,7 +351,7 @@ func (uc *upstreamConn) sendNextPendingCommand(cmd string) {
 		return
 	}
 	pendingCmd := uc.pendingCmds[cmd][0]
-	uc.SendMessageLabeled(context.TODO(), pendingCmd.downstreamID, pendingCmd.msg)
+	uc.SendMessageLabeled(context.TODO(), pendingCmd.downstreamID, pendingCmd.downstreamLabel, pendingCmd.msg)
 }
 
 func (uc *upstreamConn) enqueueCommand(dc *downstreamConn, msg *irc.Message) {
@@ -360,8 +363,9 @@ func (uc *upstreamConn) enqueueCommand(dc *downstreamConn, msg *irc.Message) {
 	}
 
 	uc.pendingCmds[msg.Command] = append(uc.pendingCmds[msg.Command], pendingUpstreamCommand{
-		downstreamID: dc.id,
-		msg:          msg,
+		downstreamID:    dc.id,
+		downstreamLabel: dc.label,
+		msg:             msg,
 	})
 
 	if len(uc.pendingCmds[msg.Command]) == 1 {
@@ -418,6 +422,26 @@ func (uc *upstreamConn) parseMembershipPrefix(s string) (ms *memberships, nick s
 	return &memberships, s[i:]
 }
 
+func (uc *upstreamConn) parseLabel(label string) (downstreamID uint64, downstreamLabel string, err error) {
+	if label == "" {
+		return
+	}
+	parts := strings.SplitN(label, "-", 4)
+	if len(parts) < 4 {
+		err = errors.New("not enough arguments")
+	} else if parts[0] != "sd" {
+		err = fmt.Errorf("expected %v, got %v", "sd", parts[0])
+	} else {
+		downstreamID, err = strconv.ParseUint(parts[1], 10, 64)
+	}
+	if err != nil {
+		err = fmt.Errorf("unexpected message label: invalid downstream reference for label %q: %v", label, err)
+		return
+	}
+	downstreamLabel = parts[3]
+	return
+}
+
 func (uc *upstreamConn) handleMessage(ctx context.Context, msg *irc.Message) error {
 	var label string
 	if l, ok := msg.GetTag("label"); ok {
@@ -425,30 +449,45 @@ func (uc *upstreamConn) handleMessage(ctx context.Context, msg *irc.Message) err
 		delete(msg.Tags, "label")
 	}
 
+	var batchName string
+	batchLabel := false
 	var msgBatch *batch
-	if batchName, ok := msg.GetTag("batch"); ok {
+	if batch, ok := msg.GetTag("batch"); ok {
+		batchName = batch
 		b, ok := uc.batches[batchName]
 		if !ok {
 			return fmt.Errorf("unexpected batch reference: batch was not defined: %q", batchName)
 		}
 		msgBatch = &b
 		if label == "" {
+			batchLabel = true
 			label = msgBatch.Label
 		}
 		delete(msg.Tags, "batch")
 	}
 
-	var downstreamID uint64
-	if label != "" {
-		var labelOffset uint64
-		n, err := fmt.Sscanf(label, "sd-%d-%d", &downstreamID, &labelOffset)
-		if err == nil && n < 2 {
-			err = errors.New("not enough arguments")
-		}
-		if err != nil {
-			return fmt.Errorf("unexpected message label: invalid downstream reference for label %q: %v", label, err)
+	downstreamID, downstreamLabel, err := uc.parseLabel(label)
+	if err != nil {
+		return err
+	}
+	if downstreamID != 0 {
+		if batchLabel {
+			// label comes from batch, send the message as part of that batch
+			uc.forEachDownstreamByID(downstreamID, func(dc *downstreamConn) {
+				dc.labelBatch = batchName
+			})
+		} else {
+			// label comes from this message, respond to the message with that label
+			uc.forEachDownstreamByID(downstreamID, func(dc *downstreamConn) {
+				dc.label = downstreamLabel
+			})
 		}
 	}
+	defer func() {
+		uc.forEachDownstreamByID(downstreamID, func(dc *downstreamConn) {
+			dc.FlushBatch()
+		})
+	}()
 
 	if msg.Prefix == nil {
 		msg.Prefix = uc.serverPrefix
@@ -895,12 +934,39 @@ func (uc *upstreamConn) handleMessage(ctx context.Context, msg *irc.Message) err
 				Outer:  msgBatch,
 				Label:  label,
 			}
+			if downstreamID != 0 && downstreamLabel != "" {
+				uc.forEachDownstreamByID(downstreamID, func(dc *downstreamConn) {
+					dc.label = ""
+					dc.SendMessage(&irc.Message{
+						Prefix:  uc.srv.prefix(),
+						Command: "BATCH",
+						Params:  msg.Params,
+						Tags: irc.Tags{
+							"label": irc.TagValue(downstreamLabel),
+						},
+					})
+				})
+			}
 		} else if strings.HasPrefix(tag, "-") {
 			tag = tag[1:]
 			if _, ok := uc.batches[tag]; !ok {
 				return fmt.Errorf("unknown BATCH reference tag: %q", tag)
 			}
+			label := uc.batches[tag].Label
 			delete(uc.batches, tag)
+
+			// BATCH - does not have @label/@batch attached to it, so downstreamID is empty.
+			// extract it back from the batch struct.
+			downstreamID, downstreamLabel, err := uc.parseLabel(label)
+			if downstreamID != 0 && downstreamLabel != "" && err == nil {
+				uc.forEachDownstreamByID(downstreamID, func(dc *downstreamConn) {
+					dc.SendMessage(&irc.Message{
+						Prefix:  uc.srv.prefix(),
+						Command: "BATCH",
+						Params:  msg.Params,
+					})
+				})
+			}
 		} else {
 			return fmt.Errorf("unexpected BATCH reference tag: missing +/- prefix: %q", tag)
 		}
@@ -2043,12 +2109,12 @@ func (uc *upstreamConn) SendMessage(ctx context.Context, msg *irc.Message) {
 	uc.conn.SendMessage(ctx, msg)
 }
 
-func (uc *upstreamConn) SendMessageLabeled(ctx context.Context, downstreamID uint64, msg *irc.Message) {
+func (uc *upstreamConn) SendMessageLabeled(ctx context.Context, downstreamID uint64, label string, msg *irc.Message) {
 	if uc.caps.IsEnabled("labeled-response") {
 		if msg.Tags == nil {
 			msg.Tags = make(map[string]irc.TagValue)
 		}
-		msg.Tags["label"] = irc.TagValue(fmt.Sprintf("sd-%d-%d", downstreamID, uc.nextLabelID))
+		msg.Tags["label"] = irc.TagValue(fmt.Sprintf("sd-%d-%d-%s", downstreamID, uc.nextLabelID, label))
 		uc.nextLabelID++
 	}
 	uc.SendMessage(ctx, msg)

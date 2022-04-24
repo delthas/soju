@@ -308,6 +308,15 @@ func parseMessageParams(msg *irc.Message, out ...*string) error {
 	return nil
 }
 
+func copyWithTag(msg *irc.Message, key string, value string) *irc.Message {
+	m := msg.Copy()
+	if m.Tags == nil {
+		m.Tags = make(irc.Tags)
+	}
+	m.Tags[key] = irc.TagValue(value)
+	return m
+}
+
 func copyClientTags(tags irc.Tags) irc.Tags {
 	t := make(irc.Tags, len(tags))
 	for k, v := range tags {

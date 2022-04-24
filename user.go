@@ -158,10 +158,10 @@ func newNetwork(user *user, record *Network, channels []Channel) *network {
 func (net *network) forEachDownstream(f func(*downstreamConn)) {
 	for _, dc := range net.user.downstreamConns {
 		if dc.network == nil && !dc.isMultiUpstream {
-			return
+			continue
 		}
 		if dc.network != nil && dc.network != net {
-			return
+			continue
 		}
 		f(dc)
 	}
@@ -688,10 +688,7 @@ func (u *user) run() {
 				break
 			}
 			err := dc.handleMessage(context.TODO(), msg)
-			if ircErr, ok := err.(ircError); ok {
-				ircErr.Message.Prefix = dc.srv.prefix()
-				dc.SendMessage(ircErr.Message)
-			} else if err != nil {
+			if err != nil {
 				dc.logger.Printf("failed to handle message %q: %v", msg, err)
 				dc.Close()
 			}
