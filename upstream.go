@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -41,6 +42,14 @@ var permanentUpstreamCaps = map[string]bool{
 
 	"draft/account-registration": true,
 	"draft/extended-monitor":     true,
+}
+
+type redirectionError struct {
+	url *url.URL
+}
+
+func (err redirectionError) Error() string {
+	return fmt.Sprintf("redirected to %v", err.url)
 }
 
 type registrationError struct {
@@ -163,7 +172,7 @@ type upstreamConn struct {
 	hasDesiredNick bool
 }
 
-func connectToUpstream(ctx context.Context, network *network) (*upstreamConn, error) {
+func connectToUpstream(ctx context.Context, network *network, u *url.URL) (*upstreamConn, error) {
 	logger := &prefixLogger{network.user.logger, fmt.Sprintf("upstream %q: ", network.GetName())}
 
 	ctx, cancel := context.WithTimeout(ctx, connectTimeout)
@@ -171,9 +180,12 @@ func connectToUpstream(ctx context.Context, network *network) (*upstreamConn, er
 
 	var dialer net.Dialer
 
-	u, err := network.URL()
-	if err != nil {
-		return nil, err
+	if u == nil {
+		var err error
+		u, err = network.URL()
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	var netConn net.Conn
@@ -243,6 +255,7 @@ func connectToUpstream(ctx context.Context, network *network) (*upstreamConn, er
 		}
 	case "irc+unix", "unix":
 		logger.Printf("connecting to Unix socket at path %q", u.Path)
+		var err error
 		netConn, err = dialer.DialContext(ctx, "unix", u.Path)
 		if err != nil {
 			return nil, fmt.Errorf("failed to connect to Unix socket %q: %v", u.Path, err)
@@ -772,6 +785,26 @@ func (uc *upstreamConn) handleMessage(ctx context.Context, msg *irc.Message) err
 			}
 
 			dc.SendMessage(msg)
+		}
+	case "010": // RPL_BOUNCE
+		if uc.registered {
+			uc.logger.Printf("redirection received after registration")
+			break
+		}
+		var host, port string
+		if err := parseMessageParams(msg, nil, &host, &port); err != nil {
+			return err
+		}
+		var u url.URL
+		if strings.HasPrefix(port, "+") {
+			port = strings.TrimPrefix(port, "+")
+			u.Scheme = "ircs"
+		} else {
+			u.Scheme = "irc+insecure"
+		}
+		u.Host = net.JoinHostPort(host, port)
+		return redirectionError{
+			url: &u,
 		}
 	case irc.RPL_WELCOME:
 		if err := parseMessageParams(msg, &uc.nick); err != nil {
@@ -2053,7 +2086,9 @@ func (uc *upstreamConn) runUntilRegistered(ctx context.Context) error {
 		}
 
 		if err := uc.handleMessage(ctx, msg); err != nil {
-			if _, ok := err.(registrationError); ok {
+			if _, ok := err.(redirectionError); ok {
+				return err
+			} else if _, ok := err.(registrationError); ok {
 				return err
 			} else {
 				msg.Tags = nil // prevent message tags from cluttering logs

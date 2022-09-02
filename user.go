@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -208,22 +209,38 @@ func (net *network) runConn(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
 
-	uc, err := connectToUpstream(ctx, net)
-	if err != nil {
-		return fmt.Errorf("failed to connect: %w", err)
+	var uc *upstreamConn
+	var redirectURL *url.URL
+	for {
+		var err error
+		uc, err = connectToUpstream(ctx, net, redirectURL)
+		if err != nil {
+			return fmt.Errorf("failed to connect: %w", err)
+		}
+
+		if net.user.srv.Identd != nil {
+			net.user.srv.Identd.Store(uc.RemoteAddr().String(), uc.LocalAddr().String(), userIdent(&net.user.User))
+		}
+
+		// TODO: this is racy, we're not running in the user goroutine yet
+		// uc.register accesses user/network DB records
+		uc.register(ctx)
+		if err := uc.runUntilRegistered(ctx); err != nil {
+			if re, ok := err.(redirectionError); ok {
+				uc.Close()
+				if net.user.srv.Identd != nil {
+					net.user.srv.Identd.Delete(uc.RemoteAddr().String(), uc.LocalAddr().String())
+				}
+				redirectURL = re.url
+				continue
+			}
+			return fmt.Errorf("failed to register: %w", err)
+		}
+		break
 	}
 	defer uc.Close()
-
 	if net.user.srv.Identd != nil {
-		net.user.srv.Identd.Store(uc.RemoteAddr().String(), uc.LocalAddr().String(), userIdent(&net.user.User))
 		defer net.user.srv.Identd.Delete(uc.RemoteAddr().String(), uc.LocalAddr().String())
-	}
-
-	// TODO: this is racy, we're not running in the user goroutine yet
-	// uc.register accesses user/network DB records
-	uc.register(ctx)
-	if err := uc.runUntilRegistered(ctx); err != nil {
-		return fmt.Errorf("failed to register: %w", err)
 	}
 
 	// TODO: this is racy with net.stopped. If the network is stopped
