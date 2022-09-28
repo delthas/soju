@@ -459,10 +459,24 @@ func (cm *monitorCasemapMap) ForEach(f func(name string, online bool)) {
 	}
 }
 
-type casemapSet struct{ casemapMap }
+type pushTargetCasemapMap struct{ casemapMap }
 
-func (cs *casemapSet) Add(name string) {
-	cs.set(name, nil)
+func (cm *pushTargetCasemapMap) Get(name string) (last time.Time) {
+	if v := cm.get(name); v == nil {
+		return time.Time{}
+	} else {
+		return v.(time.Time)
+	}
+}
+
+func (cm *pushTargetCasemapMap) Set(name string, last time.Time) {
+	cm.set(name, last)
+}
+
+func (cm *pushTargetCasemapMap) ForEach(f func(name string, last time.Time)) {
+	for _, entry := range cm.m {
+		f(entry.originalKey, entry.value.(time.Time))
+	}
 }
 
 func isWordBoundary(r rune) bool {
