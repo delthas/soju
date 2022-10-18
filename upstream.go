@@ -485,8 +485,12 @@ func (uc *upstreamConn) handleMessage(ctx context.Context, msg *irc.Message) err
 		msg.Prefix = uc.serverPrefix
 	}
 
-	if _, ok := msg.Tags["time"]; !ok && !isNumeric(msg.Command) {
-		msg.Tags["time"] = irc.TagValue(xirc.FormatServerTime(time.Now()))
+	if !isNumeric(msg.Command) {
+		t, err := time.Parse(xirc.ServerTimeLayout, string(msg.Tags["time"]))
+		if err != nil {
+			t = time.Now()
+		}
+		msg.Tags["time"] = irc.TagValue(uc.user.FormatServerTime(t))
 	}
 
 	switch msg.Command {
