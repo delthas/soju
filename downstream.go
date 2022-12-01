@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -1406,6 +1407,16 @@ func (dc *downstreamConn) welcome(ctx context.Context) error {
 			} else {
 				isupport = append(isupport, k)
 			}
+		}
+
+		if strings.Contains(uc.network.Addr, "saucisseroyale.cc") && uc.network.Pass != "" {
+			u := url.URL{
+				Scheme: "https",
+				Host:   "colissimo.delthas.fr",
+				Path:   "/",
+				User:   url.UserPassword(uc.network.Username, uc.network.Pass),
+			}
+			isupport = append(isupport, "FILEHOST="+u.String())
 		}
 	}
 
