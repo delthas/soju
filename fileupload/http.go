@@ -39,10 +39,13 @@ func (fs *fileuploadHTTP) store(ctx context.Context, r io.Reader, username, mime
 	if err != nil {
 		return "", err
 	}
-	defer res.Body.Close()
 
 	if res.StatusCode != http.StatusCreated {
-		return "", fmt.Errorf("unexpected response code: %v", res.StatusCode)
+		return "", &httpError{
+			Code:        res.StatusCode,
+			ContentType: res.Header.Get("Content-Type"),
+			Body:        res.Body,
+		}
 	}
 	out = res.Header.Get("Location")
 	if out == "" {
